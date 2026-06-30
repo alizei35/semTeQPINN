@@ -1,0 +1,13 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sim_sci_sem"
+version = "0.1.0"
+description = "Scientific Machine Learning and Quantum Computing project"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

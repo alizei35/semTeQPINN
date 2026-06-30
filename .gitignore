@@ -1,0 +1,7 @@
+# .gitignore
+.quant/
+references/
+__pycache__/
+.ipynb_checkpoints/
+outputs/
+*.pyc
