@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-def init_fnn_params(key,input_dim,output_dim,n_hidden_layers,branch_width):
+def init_params(key,input_dim,output_dim,n_hidden_layers,branch_width):
     params = []
     keys = jax.random.split(key, n_hidden_layers+1)
 
@@ -20,7 +20,7 @@ def init_fnn_params(key,input_dim,output_dim,n_hidden_layers,branch_width):
 
     return params
 
-def fnn_forward(params,x):
+def forward(params,x):
     for param in params[:-1]:
         x_augmented = jnp.append(x,1.0)
         x = jax.nn.tanh(jnp.dot(param,x_augmented))

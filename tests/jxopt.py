@@ -1,11 +1,10 @@
 import jax
-import optax
+import jaxopt
 import jax.numpy as jnp
 import pennylane as qp
 import numpy as np
 from scipy.integrate import solve_ivp
 from sim_sci_sem.nn import linear
-from sim_sci_sem.quantum import embedding, ansatz
 jax.config.update("jax_enable_x64", True)
 
 INPUT_DIM = 1
@@ -22,20 +21,33 @@ dev = qp.device("default.qubit", wires=N_QUBITS)
 
 @qp.qnode(dev,interface="jax",diff_method="backprop")
 def circuit(x,basis,thetas):
-    n_wires = len(dev.wires)
+    n_qubits = len(dev.wires)
     n_layers = thetas.shape[0]
 
-    embedding.Trainable(basis,x,dev.wires)
-    ansatz.HardwareEfficient(thetas,dev.wires,n_wires,n_layers)
+    # FNN Basis Embedding
+    qp.AngleEmbedding(features=basis*x,wires=dev.wires,rotation='Y')
 
-    return qp.expval(qp.sum(*[qp.PauliZ(i) for i in range(n_wires)]))
+    # Hardware Efficient Ansatz
+    for i in range(n_layers):
+        for j in range(n_qubits):
+            qp.RX(thetas[i,j,0],wires=j)
+            qp.RY(thetas[i,j,1],wires=j)
+            qp.RZ(thetas[i,j,2],wires=j)
+        for j in range(n_qubits-1):
+            qp.CNOT(wires=[j,j+1])
+
+    return [qp.expval(qp.PauliZ(i)) for i in dev.wires]
 
 def u_single(vars, coord):
     params = vars["params"]
     thetas = vars["thetas"]
+
     coord_rescaled = 0.95*(2.0*coord-1.0)
+
     basis = linear.forward(params,coord_rescaled)
-    return circuit(coord_rescaled,basis,thetas)
+    expvals = circuit(coord_rescaled,basis,thetas)
+
+    return jnp.sum(jnp.array(expvals))
 u_batched = jax.vmap(u_single, in_axes=(None,0))
 du_dx_single = jax.grad(u_single,argnums=1)
 du_dx_batched = jax.vmap(du_dx_single, in_axes=(None,0))
@@ -44,9 +56,9 @@ def derivatives_fnc(u,x):
     du_dx = 4*u - 6*u**2 + jnp.sin(50*x) + u*jnp.cos(25*x) - 0.5
     return du_dx
 
-def loss_diff_fnc(vars, coords):
+def loss_diff_fnc(vars,coords):
     u = u_batched(vars,coords)
-    du_dx_for = du_dx_batched(vars, coords)[:,0]
+    du_dx_for = du_dx_batched(vars,coords)[:,0]
     du_dx_ref = derivatives_fnc(u,coords[:,0])
     res = du_dx_for - du_dx_ref
     return jnp.mean(res**2)
@@ -65,8 +77,8 @@ coords = jax.random.uniform(collocation_key,(X_COLLOC_POINTS,1),
 coords = jnp.sort(coords, axis=0)
 def scipy_ode_func(x,u):
     return 4*u - 6*u**2 + np.sin(50*x) + u*np.cos(25*x) - 0.5
-coords_eval = np.array(coords[:,0])
-sol = solve_ivp(scipy_ode_func, [0.0,X_END+1e-6],[0.75],t_eval=coords_eval)
+x_eval_points = np.array(coords[:,0])
+sol = solve_ivp(scipy_ode_func, [0.0,X_END+1e-6],[0.75],t_eval=x_eval_points)
 reference = jnp.array(sol.y[0])
 
 params = linear.init_params(init_key,input_dim=INPUT_DIM,output_dim=N_QUBITS,
@@ -76,58 +88,32 @@ thetas = jax.random.uniform(thetas_key,(N_LAYERS,N_QUBITS,3),
                             minval=0.0,maxval=1.0)
 vars = {"params":params,"thetas":thetas}
 
-linesearch_cfg = optax.scale_by_zoom_linesearch(
-    max_linesearch_steps=25,
-    max_learning_rate=1.0,
-    slope_rtol=1e-4,
-    curv_rtol=0.9,
-    initial_guess_strategy="one",
-    verbose=False
-)
-opt = optax.lbfgs(
-    memory_size=100,
-    scale_init_precond=True,
-    linesearch=linesearch_cfg
-)
-
-def run_opt(init_vars,fun,opt,max_iter,tol):
-    def step(carry):
-        vars,state,_ = carry
-        value,grad = jax.value_and_grad(fun)(vars)
-        updates,state = opt.update(
-            grad,state,vars,value=value,grad=grad,value_fn=fun
-        )
-        vars = optax.apply_updates(vars,updates)
-        return vars,state,value
-    def continuing_criterion(carry):
-        _,state,_ = carry
-        iter_num = optax.tree.get(state,'count')
-        grad = optax.tree.get(state,'grad')
-        err = optax.tree.norm(grad)
-        return (iter_num==0) | ((iter_num<max_iter) & (err>=tol))
-    init_carry = (init_vars,opt.init(init_vars),float('inf'))
-    final_vars,final_state,final_value = jax.lax.while_loop(
-        continuing_criterion, step, init_carry
-    )
-    return final_vars,final_state,final_value
+solver = jaxopt.LBFGS(fun=loss_fnc, maxiter=20, tol=1e-9, stepsize=0.0,
+                      history_size=100, linesearch="zoom")
+state = solver.init_state(vars, coords=coords)
 
 @jax.jit
-def run(vars,coords,max_iter=20,tol=1e-8):
-    fun = lambda vars: loss_fnc(vars,coords)
-    final_vars,final_state,final_value = run_opt(vars,fun,opt,max_iter,tol)
-    return final_vars,final_state,final_value
+def lbfgs_step(vars,state,coords):
+    vars, state = solver.update(vars,state,coords=coords)
+    return vars, state, state.value
 
-for epoch in range(500):
-    vars,state,value = run(vars,coords)
-    print(f"Epoch {epoch}, Loss: {value}")
+@jax.jit
+def compute_MSE_ref(vars,coords,reference):
+    prediction = u_batched(vars,coords)
+    return jnp.mean((prediction-reference)**2), prediction
 
-prediction = jax.jit(u_batched)(vars,coords)
+print("Starting L-BFGS Optimizaiton...")
+for epoch in range(10000):
+    vars, state, loss_val = lbfgs_step(vars,state,coords)
+    mse, prediction = compute_MSE_ref(vars,coords,reference)
+    print(f"Epoch {epoch}, Loss: {loss_val:.2E}, MSE: {mse:.2E}")
+
 import matplotlib.pyplot as plt
 reference_np = np.array(reference)
 prediction_np = np.array(prediction)
 fig = plt.figure()
 ax = fig.subplots()
-ax.plot(coords_eval,reference_np,label='true')
-ax.plot(coords_eval,prediction_np,label='appr')
+ax.plot(x_eval_points,reference_np,label='true')
+ax.plot(x_eval_points,prediction_np,label='appr')
 ax.legend()
 plt.show()

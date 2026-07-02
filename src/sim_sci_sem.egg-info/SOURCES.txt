@@ -6,6 +6,8 @@ src/sim_sci_sem.egg-info/SOURCES.txt
 src/sim_sci_sem.egg-info/dependency_links.txt
 src/sim_sci_sem.egg-info/top_level.txt
 src/sim_sci_sem/nn/__init__.py
-src/sim_sci_sem/nn/fnn.py
+src/sim_sci_sem/nn/linear.py
 src/sim_sci_sem/quantum/__init__.py
+src/sim_sci_sem/quantum/ansatz.py
+src/sim_sci_sem/quantum/embedding.py
 tests/test.py
